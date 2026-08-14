@@ -1,0 +1,163 @@
+name: windows-e2e
+
+# Fork-only. Upstream declined Windows CI, so real-cluster validation lives here.
+# Scales a long-lived AKS Windows pool 0 -> 1, exercises pkg/cri over the
+# containerd named pipe from a HostProcess pod, then scales back to 0.
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "git ref to test"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  windows-node-e2e:
+    name: image deletion over npipe (real Windows node)
+    runs-on: ubuntu-latest
+    environment: windows-e2e
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.5"
+          cache: true
+
+      - name: build windows CRI checker
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -ldflags="-s -w" -o winspike.exe ./hack/winspike
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: scale windows pool to 1
+        run: |
+          az aks nodepool scale \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --cluster-name "${{ vars.AKS_CLUSTER }}" \
+            --name "${{ vars.AKS_WINDOWS_POOL }}" \
+            --node-count 1 --output none
+
+      - name: get kubeconfig
+        run: |
+          az aks get-credentials \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER }}" \
+            --overwrite-existing --only-show-errors
+
+      - name: wait for windows node
+        run: |
+          for i in $(seq 1 60); do
+            node=$(kubectl get nodes -l kubernetes.io/os=windows \
+              -o jsonpath='{.items[?(@.status.conditions[-1].type=="Ready")].metadata.name}')
+            if [ -n "$node" ]; then
+              echo "WINDOWS_NODE=$node" >> "$GITHUB_ENV"
+              kubectl get node "$node" -o wide
+              exit 0
+            fi
+            echo "waiting for a ready windows node ($i/60)"
+            sleep 15
+          done
+          echo "no windows node became ready"
+          kubectl get nodes -o wide
+          exit 1
+
+      - name: start HostProcess pod
+        run: |
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: winspike
+          spec:
+            restartPolicy: Never
+            hostNetwork: true
+            nodeSelector:
+              kubernetes.io/os: windows
+            securityContext:
+              windowsOptions:
+                hostProcess: true
+                runAsUserName: "NT AUTHORITY\\SYSTEM"
+            containers:
+              - name: shell
+                image: mcr.microsoft.com/windows/nanoserver:ltsc2022
+                command: ["powershell.exe", "-NoProfile", "-Command", "Start-Sleep -Seconds 2700"]
+          EOF
+          kubectl wait --for=condition=Ready pod/winspike --timeout=15m
+
+      - name: copy checker onto the node
+        # HostProcess containers resolve the host's tar.exe, so kubectl cp works
+        # even though the nanoserver base image has no tar.
+        run: kubectl cp winspike.exe winspike:winspike.exe
+
+      - name: list and delete an unused image over npipe
+        run: |
+          kubectl exec winspike -- powershell.exe -NoProfile -Command \
+            'C:\hpc\winspike.exe -delete-largest-unused' | tee result.txt
+          {
+            echo "### Windows npipe E2E"
+            echo '```'
+            cat result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: least-privilege regression (LocalService must be denied)
+        # Recorded as a test so a future containerd ACL change is noticed rather
+        # than silently widening what the worker pod needs.
+        run: |
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: winspike-lowpriv
+          spec:
+            restartPolicy: Never
+            hostNetwork: true
+            nodeSelector:
+              kubernetes.io/os: windows
+            securityContext:
+              windowsOptions:
+                hostProcess: true
+                runAsUserName: "NT AUTHORITY\\LocalService"
+            containers:
+              - name: probe
+                image: mcr.microsoft.com/windows/nanoserver:ltsc2022
+                command: ["powershell.exe", "-NoProfile", "-Command", "C:\\hpc\\winspike.exe"]
+          EOF
+          kubectl wait --for=jsonpath='{.status.phase}'=Failed pod/winspike-lowpriv --timeout=5m
+          kubectl logs winspike-lowpriv | grep -qi "access is denied" \
+            && echo "expected: LocalService denied on the containerd pipe" \
+            || { echo "LocalService was NOT denied - re-check the least-privilege assumption"; exit 1; }
+
+      - name: collect diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -o wide || true
+          kubectl describe pod winspike || true
+          kubectl logs winspike || true
+
+      - name: scale windows pool back to 0
+        if: always()
+        run: |
+          kubectl delete pod winspike winspike-lowpriv --ignore-not-found --wait=false || true
+          az aks nodepool scale \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --cluster-name "${{ vars.AKS_CLUSTER }}" \
+            --name "${{ vars.AKS_WINDOWS_POOL }}" \
+            --node-count 0 --output none
