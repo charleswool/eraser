@@ -1,0 +1,101 @@
+name: windows-ci
+
+# Fork-only: upstream declined Windows CI, so cross-platform validation for the
+# Windows port lives here.
+on:
+  push:
+    branches:
+      - "ci/**"
+      - "feat/windows-**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.5"
+
+jobs:
+  windows-build:
+    name: build ${{ matrix.pkg }} (windows/amd64)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg:
+          - ./pkg/utils/...
+          - ./pkg/cri/...
+          - ./pkg/remover/...
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: cross-compile for windows
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build ${{ matrix.pkg }}
+      - name: vet for windows
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go vet ${{ matrix.pkg }}
+
+  windows-test:
+    name: unit tests on windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: go test (native windows)
+        run: go test -v ./pkg/utils/... ./pkg/cri/...
+
+  linux-regression:
+    name: linux unaffected
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: build all
+        run: go build ./...
+      - name: go test
+        run: go test ./pkg/... ./api/... ./controllers/...
+
+  windows-port-status:
+    name: remaining windows blockers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Tracks the packages still blocked on the Unix FIFO handoff so the list
+      # shrinks visibly as the port lands. Never fails the build.
+      - name: report packages that still fail for windows
+        continue-on-error: true
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          go build ./... 2>&1 | tee build.log || true
+          echo "### Windows port status" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s build.log ]; then
+            echo "Packages still failing for GOOS=windows:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat build.log >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "All packages build for GOOS=windows." >> "$GITHUB_STEP_SUMMARY"
+          fi
