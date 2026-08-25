@@ -30,15 +30,19 @@ func main() {
 	completePath := filepath.Join(d, "eraseComplete")
 	absentPath := filepath.Join(d, "noSuchScanner")
 
+	// not deferred: every failure path below is os.Exit, which would skip it
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+
 	var err error
 	switch *role {
 	case "producer":
-		err = producer(imagesPath, completePath)
+		err = producer(ctx, imagesPath, completePath)
 	case "consumer":
-		err = consumer(imagesPath, completePath, absentPath)
+		err = consumer(ctx, imagesPath, completePath, absentPath)
 	default:
 		err = fmt.Errorf("-role must be producer or consumer")
 	}
+	cancel()
 
 	if err != nil {
 		fmt.Printf("RESULT %s: FAIL %v\n", *role, err)
@@ -49,7 +53,7 @@ func main() {
 
 // producer stands in for the collector: hand the image list over, then wait to
 // be told the erase finished.
-func producer(imagesPath, completePath string) error {
+func producer(ctx context.Context, imagesPath, completePath string) error {
 	images := []unversioned.Image{
 		{ImageID: "sha256:aaa", Names: []string{"mcr.microsoft.com/windows/servercore:ltsc2022"}},
 		{ImageID: "sha256:bbb", Names: []string{"mcr.microsoft.com/windows/nanoserver:ltsc2022"}},
@@ -63,7 +67,7 @@ func producer(imagesPath, completePath string) error {
 	defer func() { _ = completion.Close() }()
 
 	start := time.Now()
-	if err := util.WriteImagesPipe(imagesPath, images); err != nil {
+	if err := util.WriteImagesPipe(ctx, imagesPath, images); err != nil {
 		return fmt.Errorf("write images: %w", err)
 	}
 	fmt.Printf("producer   WriteImagesPipe: OK %d images in %s\n", len(images), took(start))
@@ -84,10 +88,7 @@ func producer(imagesPath, completePath string) error {
 // consumer stands in for the remover: read the list, then signal completion. It
 // also checks that signaling an endpoint nobody published is distinguishable,
 // since that is how a disabled scanner is detected.
-func consumer(imagesPath, completePath, absentPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
+func consumer(ctx context.Context, imagesPath, completePath, absentPath string) error {
 	start := time.Now()
 	images, err := util.ReadImagesPipe(ctx, imagesPath)
 	if err != nil {
@@ -98,14 +99,14 @@ func consumer(imagesPath, completePath, absentPath string) error {
 		fmt.Printf("consumer     %s %v\n", img.ImageID, img.Names)
 	}
 
-	if err := util.WriteCompletionPipe(absentPath); err == nil {
+	if err := util.WriteCompletionPipe(ctx, absentPath); err == nil {
 		return fmt.Errorf("signaling an unpublished endpoint should have failed")
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("unpublished endpoint gave %v, want an IsNotExist error", err)
 	}
 	fmt.Printf("consumer   absent peer    : OK reported as IsNotExist\n")
 
-	if err := util.WriteCompletionPipe(completePath); err != nil {
+	if err := util.WriteCompletionPipe(ctx, completePath); err != nil {
 		return fmt.Errorf("write completion: %w", err)
 	}
 	fmt.Printf("consumer   WriteCompletion: OK\n")
