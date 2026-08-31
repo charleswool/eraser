@@ -73,7 +73,7 @@ func producer(ctx context.Context, imagesPath, completePath string) error {
 	fmt.Printf("producer   WriteImagesPipe: OK %d images in %s\n", len(images), took(start))
 
 	start = time.Now()
-	payload, err := completion.Await()
+	payload, err := completion.Await(ctx)
 	if err != nil {
 		return fmt.Errorf("await completion: %w", err)
 	}
