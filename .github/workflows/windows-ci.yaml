@@ -72,6 +72,40 @@ jobs:
       - name: go test
         run: go test ./pkg/... ./api/... ./controllers/...
 
+  windows-image-spike:
+    name: can a linux builder emit a windows image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # The whole upstream question: the Windows stages have no RUN, only a COPY
+      # out of a linux builder stage, so BuildKit should only have to assemble
+      # layers onto a windows base. If it cannot, upstream needs a windows
+      # runner and the single-tag manifest plan does not work.
+      - name: build remover for windows/amd64
+        run: |
+          docker buildx build --platform windows/amd64 --target remover \
+            -o type=oci,dest=/tmp/remover-windows.tar .
+          tar -xOf /tmp/remover-windows.tar index.json | head -c 2000
+
+      - name: build collector for windows/amd64
+        run: |
+          docker buildx build --platform windows/amd64 --target collector \
+            -o type=oci,dest=/tmp/collector-windows.tar .
+
+      # the conditional FROM must not have disturbed the existing path
+      - name: build remover for linux/amd64
+        run: |
+          docker buildx build --platform linux/amd64 --target remover \
+            -o type=oci,dest=/tmp/remover-linux.tar .
+
+      - name: both platforms under one tag
+        run: |
+          docker buildx build --platform linux/amd64,windows/amd64 --target remover \
+            -o type=oci,dest=/tmp/remover-manifest.tar .
+          tar -xOf /tmp/remover-manifest.tar index.json
+
   windows-port-status:
     name: remaining windows blockers
     runs-on: ubuntu-latest
