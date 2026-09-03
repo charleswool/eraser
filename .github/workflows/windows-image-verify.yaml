@@ -1,0 +1,109 @@
+name: windows-image-verify
+
+on:
+  push:
+    branches:
+      - ci/windows-image-stages
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  release-shape:
+    name: release invocation with attestations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # This is the exact shape release.yaml uses, with the platform string the
+      # follow-up PR would set. Upstream CI never runs this: e2e-build.yaml and
+      # scan-images.yaml both use the default PLATFORM, so the only place a
+      # multi-platform build with attestations happens is a release tag.
+      - name: remover, linux+windows, attestations on
+        run: |
+          make docker-build-remover \
+            PLATFORM="linux/amd64,windows/amd64" \
+            GENERATE_ATTESTATIONS=true \
+            OUTPUT_TYPE=type=oci,dest=/tmp/remover.tar
+
+      - name: collector, linux+windows, attestations on
+        run: |
+          make docker-build-collector \
+            PLATFORM="linux/amd64,windows/amd64" \
+            GENERATE_ATTESTATIONS=true \
+            OUTPUT_TYPE=type=oci,dest=/tmp/collector.tar
+
+      - name: what ended up in the remover index
+        run: |
+          tar -xOf /tmp/remover.tar index.json > /tmp/index.json
+          python3 - <<'EOF'
+          import json
+          idx = json.load(open('/tmp/index.json'))
+          d = idx['manifests'][0]['digest'].split(':')[1]
+          import tarfile
+          t = tarfile.open('/tmp/remover.tar')
+          inner = json.load(t.extractfile('blobs/sha256/'+d))
+          for m in inner['manifests']:
+              p = m.get('platform', {})
+              ann = m.get('annotations', {}) or {}
+              kind = ann.get('vnd.docker.reference.type', 'image')
+              print(f"{p.get('os')}/{p.get('architecture')}  {kind}")
+          EOF
+
+      # The manager and trivy-scanner stay linux-only; prove the conditional
+      # FROM did not disturb them.
+      - name: manager unchanged
+        run: |
+          make docker-build-manager \
+            PLATFORM="linux/amd64,linux/arm64" \
+            GENERATE_ATTESTATIONS=true \
+            OUTPUT_TYPE=type=oci,dest=/tmp/manager.tar
+
+  default-platform:
+    name: default PLATFORM still builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # e2e-build.yaml and scan-images.yaml call the targets without PLATFORM,
+      # so PLATFORM defaults to "linux". The conditional FROM has to resolve.
+      - name: remover, default PLATFORM, as e2e does
+        run: |
+          make docker-build-remover \
+            OUTPUT_TYPE=type=oci,dest=/tmp/remover-default.tar
+
+      - name: collector, default PLATFORM, as e2e does
+        run: |
+          make docker-build-collector \
+            OUTPUT_TYPE=type=oci,dest=/tmp/collector-default.tar
+
+  windows-only:
+    name: windows image contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build remover for windows/amd64 alone
+        run: |
+          docker buildx build --platform windows/amd64 --target remover \
+            -o type=oci,dest=/tmp/remover-windows.tar .
+          tar -xOf /tmp/remover-windows.tar index.json
+
+      - name: confirm the entrypoint and the .exe layer
+        run: |
+          mkdir -p /tmp/x && tar -xf /tmp/remover-windows.tar -C /tmp/x
+          python3 - <<'EOF'
+          import json, glob, os
+          idx = json.load(open('/tmp/x/index.json'))
+          def blob(d): return '/tmp/x/blobs/sha256/'+d.split(':')[1]
+          m = json.load(open(blob(idx['manifests'][0]['digest'])))
+          if m.get('mediaType','').endswith('index.v1+json') or 'manifests' in m:
+              m = json.load(open(blob(m['manifests'][0]['digest'])))
+          cfg = json.load(open(blob(m['config']['digest'])))
+          print('os      :', cfg.get('os'))
+          print('osversion:', cfg.get('os.version'))
+          print('entrypoint:', cfg['config'].get('Entrypoint'))
+          EOF
